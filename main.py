@@ -25,9 +25,9 @@ app.add_middleware(
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://oeegjfyzwflgqeqpjylc.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
-# Tabela e filtros fixos
 TABELA = "vendas_itens_importados"
 EMPRESA = "PRATICMIX"
+PAGE_SIZE = 1000  # Supabase max per request
 
 def get_supabase():
     if not SUPABASE_KEY:
@@ -68,6 +68,7 @@ class ProjecaoResponse(BaseModel):
     total_geral_quantidade: float
     total_clientes: int
     total_itens_unicos: int
+    total_registros_historico: int
     gerado_em: str
 
 
@@ -97,39 +98,60 @@ def media_ponderada(valores: list[float]) -> float:
     return sum(v * p for v, p in zip(valores, pesos)) / sum(pesos)
 
 
-# ─── DATA ACCESS ──────────────────────────────────────────
+# ─── DATA ACCESS (COM PAGINAÇÃO) ─────────────────────────
 
 def buscar_vendas_periodo(supabase, data_inicio: date, data_fim: date) -> list[dict]:
     """
-    Busca vendas da PRATICMIX no período.
-    Uma query só pra toda a janela de histórico (~40 dias).
+    Busca TODAS as vendas da PRATICMIX no período, paginando de 1000 em 1000.
     """
-    result = supabase.table(TABELA) \
-        .select("data_venda, cliente, produto, descricao_item, quantidade") \
-        .eq("empresa", EMPRESA) \
-        .gte("data_venda", data_inicio.isoformat()) \
-        .lte("data_venda", data_fim.isoformat()) \
-        .limit(10000) \
-        .execute()
+    todas_vendas = []
+    offset = 0
     
-    return result.data if result.data else []
+    while True:
+        result = supabase.table(TABELA) \
+            .select("data_venda, cliente, produto, descricao_item, quantidade") \
+            .eq("empresa", EMPRESA) \
+            .gte("data_venda", data_inicio.isoformat()) \
+            .lte("data_venda", data_fim.isoformat()) \
+            .range(offset, offset + PAGE_SIZE - 1) \
+            .execute()
+        
+        dados = result.data if result.data else []
+        todas_vendas.extend(dados)
+        
+        # Se retornou menos que PAGE_SIZE, acabou
+        if len(dados) < PAGE_SIZE:
+            break
+        
+        offset += PAGE_SIZE
+    
+    return todas_vendas
 
 
 def buscar_todos_clientes(supabase) -> list[str]:
-    """Clientes únicos da PRATICMIX nos últimos 60 dias."""
+    """Clientes únicos da PRATICMIX nos últimos 60 dias, com paginação."""
     data_corte = (date.today() - timedelta(days=60)).isoformat()
     
-    result = supabase.table(TABELA) \
-        .select("cliente") \
-        .eq("empresa", EMPRESA) \
-        .gte("data_venda", data_corte) \
-        .limit(10000) \
-        .execute()
+    todos = []
+    offset = 0
     
-    if not result.data:
-        return []
+    while True:
+        result = supabase.table(TABELA) \
+            .select("cliente") \
+            .eq("empresa", EMPRESA) \
+            .gte("data_venda", data_corte) \
+            .range(offset, offset + PAGE_SIZE - 1) \
+            .execute()
+        
+        dados = result.data if result.data else []
+        todos.extend(dados)
+        
+        if len(dados) < PAGE_SIZE:
+            break
+        
+        offset += PAGE_SIZE
     
-    return sorted(set(row["cliente"] for row in result.data))
+    return sorted(set(row["cliente"] for row in todos))
 
 
 # ─── CORE LOGIC ───────────────────────────────────────────
@@ -147,7 +169,8 @@ def calcular_projecao(
     datas_por_cliente = {}
     
     for venda in vendas:
-        data_str = venda["data_venda"]
+        # Normalizar data (pode vir como "2026-01-30" ou "2026-01-30T00:00:00")
+        data_str = str(venda["data_venda"])[:10]
         if data_str not in datas_historico_str:
             continue
         
@@ -212,7 +235,6 @@ def calcular_projecao(
 
 @app.post("/projecao", response_model=ProjecaoResponse)
 async def gerar_projecao(req: ProjecaoRequest):
-    """Projeção detalhada por cliente/item para os próximos N dias."""
     if not 1 <= req.dias_frente <= 7:
         raise HTTPException(400, "dias_frente deve ser entre 1 e 7")
     if not 2 <= req.semanas_historico <= 12:
@@ -223,7 +245,6 @@ async def gerar_projecao(req: ProjecaoRequest):
     data_base = date.fromisoformat(req.data_inicio) if req.data_inicio else date.today() + timedelta(days=1)
     data_mais_antiga = data_base - timedelta(weeks=req.semanas_historico, days=1)
     
-    # UMA query só pro período todo
     vendas = buscar_vendas_periodo(supabase, data_mais_antiga, date.today())
     
     dias = []
@@ -244,13 +265,13 @@ async def gerar_projecao(req: ProjecaoRequest):
         total_geral_quantidade=round(sum(d.total_quantidade for d in dias), 3),
         total_clientes=len(todos_clientes),
         total_itens_unicos=len(todos_itens),
+        total_registros_historico=len(vendas),
         gerado_em=datetime.now().isoformat(),
     )
 
 
 @app.post("/projecao/consolidado")
 async def projecao_consolidada(req: ProjecaoRequest):
-    """Projeção consolidada por ITEM (soma de todos os clientes)."""
     if not 1 <= req.dias_frente <= 7:
         raise HTTPException(400, "dias_frente deve ser entre 1 e 7")
     
@@ -289,7 +310,6 @@ async def projecao_consolidada(req: ProjecaoRequest):
 
 @app.post("/projecao/download")
 async def download_projecao(req: ProjecaoRequest):
-    """Download CSV da projeção detalhada."""
     supabase = get_supabase()
     
     data_base = date.fromisoformat(req.data_inicio) if req.data_inicio else date.today() + timedelta(days=1)
@@ -329,11 +349,35 @@ async def download_projecao(req: ProjecaoRequest):
 
 @app.get("/clientes")
 async def listar_clientes():
-    """Lista clientes únicos da PRATICMIX (últimos 60 dias)."""
     supabase = get_supabase()
-    return buscar_todos_clientes(supabase)
+    clientes = buscar_todos_clientes(supabase)
+    return {"clientes": clientes, "total": len(clientes)}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.0.0", "empresa": EMPRESA}
+    return {"status": "ok", "version": "1.1.0", "empresa": EMPRESA}
+
+
+@app.get("/debug/contagem")
+async def debug_contagem():
+    """Endpoint temporário para verificar volume de dados."""
+    supabase = get_supabase()
+    
+    # Contar registros dos últimos 60 dias
+    data_corte = (date.today() - timedelta(days=60)).isoformat()
+    vendas = buscar_vendas_periodo(supabase, date.today() - timedelta(days=60), date.today())
+    
+    # Agrupar por data
+    datas = {}
+    clientes = set()
+    for v in vendas:
+        d = str(v["data_venda"])[:10]
+        datas[d] = datas.get(d, 0) + 1
+        clientes.add(v["cliente"])
+    
+    return {
+        "total_registros": len(vendas),
+        "total_clientes_unicos": len(clientes),
+        "registros_por_data": dict(sorted(datas.items())),
+    }
