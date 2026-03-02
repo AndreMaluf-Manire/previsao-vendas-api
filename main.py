@@ -10,7 +10,7 @@ import io
 import csv
 import math
 
-app = FastAPI(title="Previsão de Vendas API", version="1.0.0")
+app = FastAPI(title="Previsão de Vendas API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,7 +27,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
 TABELA = "vendas_itens_importados"
 EMPRESA = "PRATICMIX"
-PAGE_SIZE = 1000  # Supabase max per request
+PAGE_SIZE = 1000
 
 def get_supabase():
     if not SUPABASE_KEY:
@@ -49,7 +49,6 @@ class ProjecaoItem(BaseModel):
     dia_semana_num: int
     cliente: str
     produto: str
-    descricao_item: str
     quantidade_projetada: float
     quantidade_arredondada: int
     semanas_com_dados: int
@@ -91,6 +90,10 @@ def calcular_datas_historico(data_alvo: date, semanas: int) -> list[date]:
     return [data_alvo - timedelta(weeks=i) for i in range(1, semanas + 1)]
 
 def media_ponderada(valores: list[float]) -> float:
+    """
+    Média ponderada: semanas mais recentes = mais peso.
+    Valores já vêm agrupados por data (soma do dia), ordenados do mais recente ao mais antigo.
+    """
     if not valores:
         return 0.0
     n = len(valores)
@@ -101,15 +104,12 @@ def media_ponderada(valores: list[float]) -> float:
 # ─── DATA ACCESS (COM PAGINAÇÃO) ─────────────────────────
 
 def buscar_vendas_periodo(supabase, data_inicio: date, data_fim: date) -> list[dict]:
-    """
-    Busca TODAS as vendas da PRATICMIX no período, paginando de 1000 em 1000.
-    """
     todas_vendas = []
     offset = 0
     
     while True:
         result = supabase.table(TABELA) \
-            .select("data_venda, cliente, produto, descricao_item, quantidade") \
+            .select("data_venda, cliente, produto, quantidade") \
             .eq("empresa", EMPRESA) \
             .gte("data_venda", data_inicio.isoformat()) \
             .lte("data_venda", data_fim.isoformat()) \
@@ -119,7 +119,6 @@ def buscar_vendas_periodo(supabase, data_inicio: date, data_fim: date) -> list[d
         dados = result.data if result.data else []
         todas_vendas.extend(dados)
         
-        # Se retornou menos que PAGE_SIZE, acabou
         if len(dados) < PAGE_SIZE:
             break
         
@@ -129,7 +128,6 @@ def buscar_vendas_periodo(supabase, data_inicio: date, data_fim: date) -> list[d
 
 
 def buscar_todos_clientes(supabase) -> list[str]:
-    """Clientes únicos da PRATICMIX nos últimos 60 dias, com paginação."""
     data_corte = (date.today() - timedelta(days=60)).isoformat()
     
     todos = []
@@ -165,11 +163,13 @@ def calcular_projecao(
     
     datas_historico_str = set(d.isoformat() for d in calcular_datas_historico(data_alvo, semanas_historico))
     
+    # Agrupamento: cliente -> produto -> data -> soma_quantidade
+    # Primeiro soma tudo do mesmo produto+cliente+data (ignora descricao_item)
+    # Depois faz média ponderada por data
     agrupado = {}
     datas_por_cliente = {}
     
     for venda in vendas:
-        # Normalizar data (pode vir como "2026-01-30" ou "2026-01-30T00:00:00")
         data_str = str(venda["data_venda"])[:10]
         if data_str not in datas_historico_str:
             continue
@@ -179,9 +179,7 @@ def calcular_projecao(
             continue
         
         produto = venda["produto"] or ""
-        descricao = venda["descricao_item"] or ""
         qtd = float(venda["quantidade"] or 0)
-        chave_item = (produto, descricao)
         
         if cliente not in agrupado:
             agrupado[cliente] = {}
@@ -189,21 +187,27 @@ def calcular_projecao(
         
         datas_por_cliente[cliente].add(data_str)
         
-        if chave_item not in agrupado[cliente]:
-            agrupado[cliente][chave_item] = []
+        if produto not in agrupado[cliente]:
+            agrupado[cliente][produto] = {}
         
-        agrupado[cliente][chave_item].append(qtd)
+        # Soma quantidades do mesmo produto+cliente+data
+        if data_str not in agrupado[cliente][produto]:
+            agrupado[cliente][produto][data_str] = 0.0
+        agrupado[cliente][produto][data_str] += qtd
     
+    # Calcular projeção
     itens_projecao = []
     dia_semana_nome = get_dia_semana_nome(data_alvo)
     dia_semana_num = data_alvo.weekday()
     
-    for cliente, items in agrupado.items():
+    for cliente, produtos in agrupado.items():
         semanas_com_dados = len(datas_por_cliente[cliente])
         is_novo = semanas_com_dados < semanas_historico
         
-        for (produto, descricao), quantidades in items.items():
-            qtd_projetada = media_ponderada(quantidades)
+        for produto, datas_qtd in produtos.items():
+            # Ordenar por data desc (mais recente primeiro) pra média ponderada
+            valores_ordenados = [qtd for _, qtd in sorted(datas_qtd.items(), reverse=True)]
+            qtd_projetada = media_ponderada(valores_ordenados)
             
             itens_projecao.append(ProjecaoItem(
                 data=data_alvo.isoformat(),
@@ -211,14 +215,13 @@ def calcular_projecao(
                 dia_semana_num=dia_semana_num,
                 cliente=cliente,
                 produto=produto,
-                descricao_item=descricao,
                 quantidade_projetada=round(qtd_projetada, 3),
                 quantidade_arredondada=math.ceil(qtd_projetada),
                 semanas_com_dados=semanas_com_dados,
                 is_cliente_novo=is_novo,
             ))
     
-    itens_projecao.sort(key=lambda x: (x.cliente, x.descricao_item))
+    itens_projecao.sort(key=lambda x: (x.cliente, x.produto))
     total_quantidade = sum(i.quantidade_projetada for i in itens_projecao)
     
     return ProjecaoDia(
@@ -258,7 +261,7 @@ async def gerar_projecao(req: ProjecaoRequest):
         
         for item in projecao_dia.itens:
             todos_clientes.add(item.cliente)
-            todos_itens.add(item.descricao_item)
+            todos_itens.add(item.produto)
     
     return ProjecaoResponse(
         dias=dias,
@@ -290,17 +293,15 @@ async def projecao_consolidada(req: ProjecaoRequest):
         
         itens_consolidados = {}
         for p in projecao_dia.itens:
-            chave = (p.produto, p.descricao_item)
-            if chave not in itens_consolidados:
-                itens_consolidados[chave] = 0.0
-            itens_consolidados[chave] += p.quantidade_projetada
+            if p.produto not in itens_consolidados:
+                itens_consolidados[p.produto] = 0.0
+            itens_consolidados[p.produto] += p.quantidade_projetada
         
-        for (produto, descricao), qtd in sorted(itens_consolidados.items(), key=lambda x: x[0][1]):
+        for produto, qtd in sorted(itens_consolidados.items()):
             consolidado.append({
                 "data": data_alvo.isoformat(),
                 "dia_semana": get_dia_semana_nome(data_alvo),
                 "produto": produto,
-                "descricao_item": descricao,
                 "quantidade_projetada": round(qtd, 3),
                 "quantidade_arredondada": math.ceil(qtd),
             })
@@ -319,7 +320,7 @@ async def download_projecao(req: ProjecaoRequest):
     
     output = io.StringIO()
     writer = csv.writer(output, delimiter=";")
-    writer.writerow(["DATA", "DIA_SEMANA", "CLIENTE", "PRODUTO", "DESCRICAO_ITEM", "QTD_PROJETADA", "QTD_ARREDONDADA", "SEMANAS_HISTORICO", "CLIENTE_NOVO"])
+    writer.writerow(["DATA", "DIA_SEMANA", "CLIENTE", "PRODUTO", "QTD_PROJETADA", "QTD_ARREDONDADA", "SEMANAS_HISTORICO", "CLIENTE_NOVO"])
     
     for i in range(req.dias_frente):
         data_alvo = data_base + timedelta(days=i)
@@ -331,7 +332,6 @@ async def download_projecao(req: ProjecaoRequest):
                 item.dia_semana,
                 item.cliente,
                 item.produto,
-                item.descricao_item,
                 item.quantidade_projetada,
                 item.quantidade_arredondada,
                 item.semanas_com_dados,
@@ -356,19 +356,14 @@ async def listar_clientes():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.1.0", "empresa": EMPRESA}
+    return {"status": "ok", "version": "1.2.0", "empresa": EMPRESA}
 
 
 @app.get("/debug/contagem")
 async def debug_contagem():
-    """Endpoint temporário para verificar volume de dados."""
     supabase = get_supabase()
-    
-    # Contar registros dos últimos 60 dias
-    data_corte = (date.today() - timedelta(days=60)).isoformat()
     vendas = buscar_vendas_periodo(supabase, date.today() - timedelta(days=60), date.today())
     
-    # Agrupar por data
     datas = {}
     clientes = set()
     for v in vendas:
