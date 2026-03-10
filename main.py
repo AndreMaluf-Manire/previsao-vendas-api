@@ -10,7 +10,7 @@ import io
 import csv
 import math
 
-app = FastAPI(title="Previsão de Vendas API", version="1.2.0")
+app = FastAPI(title="Previsão de Vendas API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,6 +28,10 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 TABELA = "vendas_itens_importados"
 EMPRESA = "PRATICMIX"
 PAGE_SIZE = 1000
+
+# Presença mínima: cliente precisa ter comprado em pelo menos 50% das semanas
+# para aquele dia da semana para entrar na projeção
+PRESENCA_MINIMA = 0.5
 
 def get_supabase():
     if not SUPABASE_KEY:
@@ -53,6 +57,7 @@ class ProjecaoItem(BaseModel):
     quantidade_arredondada: int
     semanas_com_dados: int
     is_cliente_novo: bool
+    pct_presenca: int
 
 class ProjecaoDia(BaseModel):
     data: str
@@ -68,6 +73,7 @@ class ProjecaoResponse(BaseModel):
     total_clientes: int
     total_itens_unicos: int
     total_registros_historico: int
+    clientes_filtrados: int
     gerado_em: str
 
 
@@ -90,10 +96,6 @@ def calcular_datas_historico(data_alvo: date, semanas: int) -> list[date]:
     return [data_alvo - timedelta(weeks=i) for i in range(1, semanas + 1)]
 
 def media_ponderada(valores: list[float]) -> float:
-    """
-    Média ponderada: semanas mais recentes = mais peso.
-    Valores já vêm agrupados por data (soma do dia), ordenados do mais recente ao mais antigo.
-    """
     if not valores:
         return 0.0
     n = len(valores)
@@ -159,13 +161,11 @@ def calcular_projecao(
     data_alvo: date,
     semanas_historico: int,
     clientes_excluidos: list[str],
-) -> ProjecaoDia:
+) -> tuple[ProjecaoDia, int]:
     
-    datas_historico_str = set(d.isoformat() for d in calcular_datas_historico(data_alvo, semanas_historico))
+    datas_historico = calcular_datas_historico(data_alvo, semanas_historico)
+    datas_historico_str = set(d.isoformat() for d in datas_historico)
     
-    # Agrupamento: cliente -> produto -> data -> soma_quantidade
-    # Primeiro soma tudo do mesmo produto+cliente+data (ignora descricao_item)
-    # Depois faz média ponderada por data
     agrupado = {}
     datas_por_cliente = {}
     
@@ -190,22 +190,28 @@ def calcular_projecao(
         if produto not in agrupado[cliente]:
             agrupado[cliente][produto] = {}
         
-        # Soma quantidades do mesmo produto+cliente+data
         if data_str not in agrupado[cliente][produto]:
             agrupado[cliente][produto][data_str] = 0.0
         agrupado[cliente][produto][data_str] += qtd
     
-    # Calcular projeção
     itens_projecao = []
     dia_semana_nome = get_dia_semana_nome(data_alvo)
     dia_semana_num = data_alvo.weekday()
+    clientes_filtrados = 0
     
     for cliente, produtos in agrupado.items():
         semanas_com_dados = len(datas_por_cliente[cliente])
-        is_novo = semanas_com_dados < semanas_historico
+        pct_presenca = semanas_com_dados / semanas_historico
+        
+        # FILTRO: só entra quem comprou em >= 50% das semanas
+        if pct_presenca < PRESENCA_MINIMA:
+            clientes_filtrados += 1
+            continue
+        
+        is_novo = pct_presenca < 1.0
+        pct_int = round(pct_presenca * 100)
         
         for produto, datas_qtd in produtos.items():
-            # Ordenar por data desc (mais recente primeiro) pra média ponderada
             valores_ordenados = [qtd for _, qtd in sorted(datas_qtd.items(), reverse=True)]
             qtd_projetada = media_ponderada(valores_ordenados)
             
@@ -219,6 +225,7 @@ def calcular_projecao(
                 quantidade_arredondada=math.ceil(qtd_projetada),
                 semanas_com_dados=semanas_com_dados,
                 is_cliente_novo=is_novo,
+                pct_presenca=pct_int,
             ))
     
     itens_projecao.sort(key=lambda x: (x.cliente, x.produto))
@@ -231,7 +238,7 @@ def calcular_projecao(
         total_itens_projetados=len(itens_projecao),
         total_quantidade=round(total_quantidade, 3),
         itens=itens_projecao,
-    )
+    ), clientes_filtrados
 
 
 # ─── ENDPOINTS ────────────────────────────────────────────
@@ -253,11 +260,13 @@ async def gerar_projecao(req: ProjecaoRequest):
     dias = []
     todos_clientes = set()
     todos_itens = set()
+    total_filtrados = 0
     
     for i in range(req.dias_frente):
         data_alvo = data_base + timedelta(days=i)
-        projecao_dia = calcular_projecao(vendas, data_alvo, req.semanas_historico, req.clientes_excluidos)
+        projecao_dia, filtrados = calcular_projecao(vendas, data_alvo, req.semanas_historico, req.clientes_excluidos)
         dias.append(projecao_dia)
+        total_filtrados += filtrados
         
         for item in projecao_dia.itens:
             todos_clientes.add(item.cliente)
@@ -269,6 +278,7 @@ async def gerar_projecao(req: ProjecaoRequest):
         total_clientes=len(todos_clientes),
         total_itens_unicos=len(todos_itens),
         total_registros_historico=len(vendas),
+        clientes_filtrados=total_filtrados,
         gerado_em=datetime.now().isoformat(),
     )
 
@@ -289,7 +299,7 @@ async def projecao_consolidada(req: ProjecaoRequest):
     
     for i in range(req.dias_frente):
         data_alvo = data_base + timedelta(days=i)
-        projecao_dia = calcular_projecao(vendas, data_alvo, req.semanas_historico, req.clientes_excluidos)
+        projecao_dia, _ = calcular_projecao(vendas, data_alvo, req.semanas_historico, req.clientes_excluidos)
         
         itens_consolidados = {}
         for p in projecao_dia.itens:
@@ -320,11 +330,11 @@ async def download_projecao(req: ProjecaoRequest):
     
     output = io.StringIO()
     writer = csv.writer(output, delimiter=";")
-    writer.writerow(["DATA", "DIA_SEMANA", "CLIENTE", "PRODUTO", "QTD_PROJETADA", "QTD_ARREDONDADA", "SEMANAS_HISTORICO", "CLIENTE_NOVO"])
+    writer.writerow(["DATA", "DIA_SEMANA", "CLIENTE", "PRODUTO", "QTD_PROJETADA", "QTD_ARREDONDADA", "SEMANAS_HISTORICO", "PCT_PRESENCA", "CLIENTE_NOVO"])
     
     for i in range(req.dias_frente):
         data_alvo = data_base + timedelta(days=i)
-        projecao_dia = calcular_projecao(vendas, data_alvo, req.semanas_historico, req.clientes_excluidos)
+        projecao_dia, _ = calcular_projecao(vendas, data_alvo, req.semanas_historico, req.clientes_excluidos)
         
         for item in projecao_dia.itens:
             writer.writerow([
@@ -335,6 +345,7 @@ async def download_projecao(req: ProjecaoRequest):
                 item.quantidade_projetada,
                 item.quantidade_arredondada,
                 item.semanas_com_dados,
+                f"{item.pct_presenca}%",
                 "Sim" if item.is_cliente_novo else "Não",
             ])
     
@@ -356,7 +367,7 @@ async def listar_clientes():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.2.0", "empresa": EMPRESA}
+    return {"status": "ok", "version": "1.3.0", "empresa": EMPRESA, "presenca_minima": f"{int(PRESENCA_MINIMA*100)}%"}
 
 
 @app.get("/debug/contagem")
