@@ -10,7 +10,7 @@ import io
 import csv
 import math
 
-app = FastAPI(title="Previsão de Vendas API", version="1.3.0")
+app = FastAPI(title="Previsão de Vendas API", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,9 +28,6 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 TABELA = "vendas_itens_importados"
 EMPRESA = "PRATICMIX"
 PAGE_SIZE = 1000
-
-# Presença mínima: cliente precisa ter comprado em pelo menos 50% das semanas
-# para aquele dia da semana para entrar na projeção
 PRESENCA_MINIMA = 0.5
 
 def get_supabase():
@@ -95,12 +92,28 @@ def get_dia_semana_nome(d: date) -> str:
 def calcular_datas_historico(data_alvo: date, semanas: int) -> list[date]:
     return [data_alvo - timedelta(weeks=i) for i in range(1, semanas + 1)]
 
-def media_ponderada(valores: list[float]) -> float:
-    if not valores:
+def media_ponderada_com_zeros(datas_qtd: dict, datas_historico_ordenadas: list[str]) -> float:
+    """
+    Média ponderada considerando TODAS as semanas históricas.
+    Semanas sem compra entram como 0.
+    Mais recente = mais peso.
+    
+    Ex: 4 semanas, comprou em 2 → valores [10, 0, 8, 0], pesos [4, 3, 2, 1]
+    Resultado: (10×4 + 0×3 + 8×2 + 0×1) / (4+3+2+1) = 5.6
+    """
+    n = len(datas_historico_ordenadas)
+    if n == 0:
         return 0.0
-    n = len(valores)
-    pesos = list(range(n, 0, -1))
-    return sum(v * p for v, p in zip(valores, pesos)) / sum(pesos)
+    
+    pesos = list(range(n, 0, -1))  # [n, n-1, ..., 1] — mais recente = maior peso
+    soma_ponderada = 0.0
+    soma_pesos = sum(pesos)
+    
+    for i, data_str in enumerate(datas_historico_ordenadas):
+        qtd = datas_qtd.get(data_str, 0.0)  # 0 se não comprou nessa semana
+        soma_ponderada += qtd * pesos[i]
+    
+    return soma_ponderada / soma_pesos
 
 
 # ─── DATA ACCESS (COM PAGINAÇÃO) ─────────────────────────
@@ -165,6 +178,8 @@ def calcular_projecao(
     
     datas_historico = calcular_datas_historico(data_alvo, semanas_historico)
     datas_historico_str = set(d.isoformat() for d in datas_historico)
+    # Ordenadas da mais recente pra mais antiga (pra pesos da média ponderada)
+    datas_ordenadas = sorted(datas_historico_str, reverse=True)
     
     agrupado = {}
     datas_por_cliente = {}
@@ -203,7 +218,6 @@ def calcular_projecao(
         semanas_com_dados = len(datas_por_cliente[cliente])
         pct_presenca = semanas_com_dados / semanas_historico
         
-        # FILTRO: só entra quem comprou em >= 50% das semanas
         if pct_presenca < PRESENCA_MINIMA:
             clientes_filtrados += 1
             continue
@@ -212,8 +226,9 @@ def calcular_projecao(
         pct_int = round(pct_presenca * 100)
         
         for produto, datas_qtd in produtos.items():
-            valores_ordenados = [qtd for _, qtd in sorted(datas_qtd.items(), reverse=True)]
-            qtd_projetada = media_ponderada(valores_ordenados)
+            # MUDANÇA v1.4: média ponderada dividindo por TODAS as semanas
+            # Semanas sem compra desse produto entram como 0
+            qtd_projetada = media_ponderada_com_zeros(datas_qtd, datas_ordenadas)
             
             itens_projecao.append(ProjecaoItem(
                 data=data_alvo.isoformat(),
@@ -367,7 +382,7 @@ async def listar_clientes():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.3.0", "empresa": EMPRESA, "presenca_minima": f"{int(PRESENCA_MINIMA*100)}%"}
+    return {"status": "ok", "version": "1.4.0", "empresa": EMPRESA, "presenca_minima": f"{int(PRESENCA_MINIMA*100)}%"}
 
 
 @app.get("/debug/contagem")
