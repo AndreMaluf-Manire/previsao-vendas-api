@@ -88,6 +88,13 @@ O que a v1.5.0 MANTEVE dessa versão (higiene, não fórmula): normalização de
 - `API_KEY`: (opcional, v1.5.1) liga a exigência do header `X-API-Key`. NUNCA commitar. Ordem crítica ao rotacionar/ativar: primeiro o front (Lovable) enviando a chave nova, DEPOIS a env no Railway — o contrário quebra a tela.
 - `PORT`: injetado pelo Railway (Dockerfile usa sh -c pra expandir ${PORT:-8080})
 
+## CONSUMIDORES DA API (todos precisam da X-API-Key quando a auth estiver ativa)
+
+1. **Frontend Lovable** — `src/components/erp/modules/PcpPrevisaoVendas.tsx` (projeto 0dffdc8e-08d0-4270-8044-afdd32e16ef4): 4 fetches diretos (`/clientes`, `/projecao`, `/projecao/consolidado`, `/projecao/download`). Header adicionado em 06/07/2026 (const `API_KEY` no componente — ver nota de segurança acima).
+2. **Edge Function `gerar-previsao-vendas`** (Supabase oeegjfyzwflgqeqpjylc, `verify_jwt=false`) — é quem o botão "Gerar Projeção" e o **cron diário 06:00 BRT** realmente usam; chama `/clientes`, `/projecao` e `/projecao/consolidado` e sobrepõe o cache `previsao_vendas_cache`. Atualizada (v5) para enviar o header lido do secret **`PREVISAO_API_KEY`** — enquanto o secret não existir, não envia nada (modo aberto segue funcionando).
+
+**Ordem de ativação da auth (crítica):** 1º front Lovable publicado enviando o header → 2º secret `PREVISAO_API_KEY` nas Edge Functions do Supabase → 3º só então a env `API_KEY` no Railway. Inverter = tela quebrada e/ou cron das 06:00 falhando em silêncio.
+
 ## COMO TESTAR EM PRODUÇÃO
 
 - Swagger: https://previsao-vendas-api-production.up.railway.app/docs
