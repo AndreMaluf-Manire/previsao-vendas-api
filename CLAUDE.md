@@ -25,12 +25,16 @@ API de projeção de vendas para a empresa PRATICMIX (Grupo Manirê, distribuido
 - Outras colunas existentes (não usadas): descricao_item, valor_unitario, valor_total_item, numero_venda, venda_id, item_id, produto_id
 
 ### Endpoints:
-- `POST /projecao` — projeção detalhada por cliente/item
-- `POST /projecao/consolidado` — projeção consolidada por item (soma clientes)
-- `POST /projecao/download` — download CSV (decimal com vírgula pro Excel BR)
-- `GET /clientes` — lista de clientes únicos (últimos 60 dias) → `{clientes: [], total: N}`
-- `GET /health` — health check
-- `GET /debug/contagem` — contagem de registros
+- `POST /projecao` — projeção detalhada por cliente/item 🔒
+- `POST /projecao/consolidado` — projeção consolidada por item (soma clientes) 🔒
+- `POST /projecao/download` — download CSV (decimal com vírgula pro Excel BR) 🔒
+- `GET /clientes` — lista de clientes únicos (últimos 60 dias) → `{clientes: [], total: N}` 🔒
+- `GET /health` — health check (sempre aberto; campo `auth` mostra se a API key está ativa)
+
+🔒 = exige header `X-API-Key` quando a env `API_KEY` está setada (v1.5.1). `/debug/contagem` foi removido na v1.5.1.
+
+### Segurança da API key (nota honesta)
+A chave é enviada pelo frontend Lovable (SPA) — ela fica **visível no bundle do navegador** para quem inspecionar. Isso barra acesso casual e scanners, NÃO um atacante dedicado. Solução definitiva documentada como refinamento futuro: proxy via Supabase Edge Function guardando a chave como secret do lado do servidor.
 
 ## HISTÓRICO DE VERSÕES E DECISÕES (importante entender antes de mexer)
 
@@ -39,6 +43,7 @@ API de projeção de vendas para a empresa PRATICMIX (Grupo Manirê, distribuido
 - **v1.3**: filtro de presença 50% (cliente precisava comprar em ≥50% das semanas). Motivo: média parcial inflava — cliente que comprou 60un em 1 de 4 quartas era projetado com 60
 - **v1.4**: média ponderada COM ZEROS (a correção certa do problema da v1.3). Comprou 60 em 1 de 4 semanas → projeta 24, não 60
 - **v1.5**: filtro de presença REMOVIDO por default (agora configurável via `presenca_minima` no request). Backtest de 12 dias (jun/jul 2026) provou: com a média-com-zeros, o filtro punia duas vezes e causava subestimação de até -34% em dias de crescimento. Erro médio absoluto: 18.6% com filtro → 15.6% sem. Também corrigido decimal do CSV (ponto → vírgula).
+- **v1.5.1**: (1) autenticação opt-in por API key — header `X-API-Key` exigido em todos os endpoints exceto `/health`, mas SÓ quando a env `API_KEY` está setada no Railway (sem a env = modo aberto, o que permitiu transição sem downtime); comparação com `secrets.compare_digest`. (2) Ordenação determinística na paginação (`.order(data_venda, venda_id, item_id, id)` antes do `.range()`) — sem order, o PostgREST não garante ordem entre páginas e escrita concorrente (import n8n) podia duplicar/pular linhas. (3) Removido `/debug/contagem` (temporário, expunha dados sem necessidade). Fórmula intocada.
 
 ### O que JÁ FOI TESTADO E REPROVADO (não reimplementar sem novo backtest):
 - **Fator de tendência** (últimos 14 dias / 14 anteriores como multiplicador): PIOROU o erro (18%). Tendência atrasada amplifica na direção errada.
@@ -62,6 +67,7 @@ Pegar datas passadas, aplicar a fórmula como se estivesse projetando (históric
 2. Tratamento de feriados (excluir semanas de carnaval/natal do histórico)
 3. Expandir para outras empresas (MANIRÊ, FRULEVE) — hoje EMPRESA é hardcoded
 4. Modelo por cliente (clientes grandes têm padrão mais estável que pequenos)
+5. Proxy de autenticação via Supabase Edge Function (chave como secret server-side, front chama a function autenticado pelo Supabase Auth) — resolve a exposição da API key no bundle do SPA
 
 ### Features removidas na v1.5.0 — candidatas a backtest futuro
 
@@ -79,6 +85,7 @@ O que a v1.5.0 MANTEVE dessa versão (higiene, não fórmula): normalização de
 
 - `SUPABASE_URL`: https://oeegjfyzwflgqeqpjylc.supabase.co
 - `SUPABASE_SERVICE_KEY`: service_role key do Supabase (NUNCA commitar)
+- `API_KEY`: (opcional, v1.5.1) liga a exigência do header `X-API-Key`. NUNCA commitar. Ordem crítica ao rotacionar/ativar: primeiro o front (Lovable) enviando a chave nova, DEPOIS a env no Railway — o contrário quebra a tela.
 - `PORT`: injetado pelo Railway (Dockerfile usa sh -c pra expandir ${PORT:-8080})
 
 ## COMO TESTAR EM PRODUÇÃO

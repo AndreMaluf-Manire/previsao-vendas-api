@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from typing import Optional
 from datetime import date, datetime, timedelta
@@ -9,8 +10,9 @@ import os
 import io
 import csv
 import math
+import secrets
 
-app = FastAPI(title="Previsão de Vendas API", version="1.5.0")
+app = FastAPI(title="Previsão de Vendas API", version="1.5.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,6 +35,21 @@ def get_supabase():
     if not SUPABASE_KEY:
         raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_KEY não configurada")
     return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+# ─── AUTENTICAÇÃO (v1.5.1) ────────────────────────────────
+# Opt-in via env: sem API_KEY setada no Railway = modo aberto (zero downtime
+# na transição). Com API_KEY setada, todos os endpoints exceto /health exigem
+# o header X-API-Key com o valor exato.
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def exigir_api_key(api_key: Optional[str] = Security(_api_key_header)):
+    chave_configurada = os.environ.get("API_KEY")
+    if not chave_configurada:
+        return  # modo aberto
+    if not api_key or not secrets.compare_digest(api_key, chave_configurada):
+        raise HTTPException(status_code=401, detail="X-API-Key ausente ou inválida")
 
 
 # ─── MODELS ───────────────────────────────────────────────
@@ -132,6 +149,10 @@ def buscar_vendas_periodo(supabase, data_inicio: date, data_fim: date) -> list[d
             .eq("empresa", EMPRESA) \
             .gte("data_venda", data_inicio.isoformat()) \
             .lte("data_venda", data_fim.isoformat()) \
+            .order("data_venda") \
+            .order("venda_id") \
+            .order("item_id") \
+            .order("id") \
             .range(offset, offset + PAGE_SIZE - 1) \
             .execute()
 
@@ -157,6 +178,10 @@ def buscar_todos_clientes(supabase) -> list[str]:
             .select("cliente") \
             .eq("empresa", EMPRESA) \
             .gte("data_venda", data_corte) \
+            .order("data_venda") \
+            .order("venda_id") \
+            .order("item_id") \
+            .order("id") \
             .range(offset, offset + PAGE_SIZE - 1) \
             .execute()
 
@@ -287,7 +312,7 @@ def _validar_request(req: ProjecaoRequest) -> date:
 
 # ─── ENDPOINTS ────────────────────────────────────────────
 
-@app.post("/projecao", response_model=ProjecaoResponse)
+@app.post("/projecao", response_model=ProjecaoResponse, dependencies=[Depends(exigir_api_key)])
 async def gerar_projecao(req: ProjecaoRequest):
     data_base = _validar_request(req)
 
@@ -323,7 +348,7 @@ async def gerar_projecao(req: ProjecaoRequest):
     )
 
 
-@app.post("/projecao/consolidado")
+@app.post("/projecao/consolidado", dependencies=[Depends(exigir_api_key)])
 async def projecao_consolidada(req: ProjecaoRequest):
     data_base = _validar_request(req)
 
@@ -357,7 +382,7 @@ async def projecao_consolidada(req: ProjecaoRequest):
     return consolidado
 
 
-@app.post("/projecao/download")
+@app.post("/projecao/download", dependencies=[Depends(exigir_api_key)])
 async def download_projecao(req: ProjecaoRequest):
     data_base = _validar_request(req)
 
@@ -397,7 +422,7 @@ async def download_projecao(req: ProjecaoRequest):
     )
 
 
-@app.get("/clientes")
+@app.get("/clientes", dependencies=[Depends(exigir_api_key)])
 async def listar_clientes():
     supabase = get_supabase()
     clientes = buscar_todos_clientes(supabase)
@@ -406,23 +431,10 @@ async def listar_clientes():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.5.0", "empresa": EMPRESA, "presenca_minima_default": "0 (sem filtro)"}
-
-
-@app.get("/debug/contagem")
-async def debug_contagem():
-    supabase = get_supabase()
-    vendas = buscar_vendas_periodo(supabase, date.today() - timedelta(days=60), date.today())
-
-    datas = {}
-    clientes = set()
-    for v in vendas:
-        d = str(v["data_venda"])[:10]
-        datas[d] = datas.get(d, 0) + 1
-        clientes.add(v["cliente"])
-
     return {
-        "total_registros": len(vendas),
-        "total_clientes_unicos": len(clientes),
-        "registros_por_data": dict(sorted(datas.items())),
+        "status": "ok",
+        "version": "1.5.1",
+        "empresa": EMPRESA,
+        "presenca_minima_default": "0 (sem filtro)",
+        "auth": "ativa" if os.environ.get("API_KEY") else "aberta (API_KEY não setada)",
     }
